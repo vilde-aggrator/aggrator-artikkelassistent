@@ -3,6 +3,9 @@ import os
 from datetime import datetime
 from pathlib import Path
 
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).parent / ".env")
+
 import streamlit as st
 
 import agent
@@ -30,10 +33,10 @@ st.markdown("""
 
 # --- News type definitions ---
 NEWS_TYPES = {
-    "type_b": "B – Ny-partner (selskap inn i Aggrator)",
-    "type_a": "A – Nyhetsmelding (kunngjøring, tilskudd, samarbeidsavtale)",
-    "type_c": "C – Program / arrangement-rapport",
-    "type_d": "D – Analytisk artikkel (trender, bransje, ressurs, politikk)",
+    "type_b": "Ny-partner (selskap inn i Aggrator)",
+    "type_a": "Nyhetsmelding (kunngjøring, tilskudd, samarbeidsavtale)",
+    "type_c": "Program / arrangement-rapport",
+    "type_d": "Analytisk artikkel (trender, bransje, ressurs, politikk)",
     "annet":  "Annet",
 }
 
@@ -49,7 +52,8 @@ DEFAULTS = {
     # Selskapsnyhet
     "company_name": "",
     "kam": "",
-    "founder": "",
+    "main_contact": "",
+    "other_team": "",
     "description": "",
     # Aggrator-nyhet
     "aggrator_what": "",
@@ -62,10 +66,27 @@ DEFAULTS = {
     "policy_relevance": "",
     # Felles
     "notes": "",
+    # Bilde til artikkelen
+    "article_image": None,
+    # Spørsmålsrunde
+    "questions": [],
+    "fields_snapshot": {},
+    "answers_snapshot": {},
+    "pending_generation": None,
+    "email_sent": None,
 }
 for k, v in DEFAULTS.items():
     if k not in st.session_state:
         st.session_state[k] = v
+
+# news_type er knyttet til artikkeltype-velgeren, som bare rendres i input-stadiet.
+# Streamlit sletter widget-state for ikke-renderte widgets, så uten dette ville
+# news_type bli tom på senere stadier – og _build_context ville da droppe alle felt.
+# Re-hydrer derfor fra snapshot i alle stadier etter input.
+if st.session_state.stage != "input":
+    _snap_type = st.session_state.fields_snapshot.get("news_type")
+    if _snap_type:
+        st.session_state.news_type = _snap_type
 
 # --- API key check ---
 if not os.environ.get("ANTHROPIC_API_KEY"):
@@ -95,6 +116,11 @@ def reset_session() -> None:
 
 def is_incubator_article() -> bool:
     return st.session_state.news_type == "type_b"
+
+def show_article_image(width: int = 420) -> None:
+    img = st.session_state.get("article_image")
+    if img and img.get("bytes"):
+        st.image(img["bytes"], caption=img.get("name", ""), width=width)
 
 # --- Progress bar ---
 STAGE_ORDER = ["input", "draft", "vilde_review", "company_review", "done"]
@@ -136,16 +162,23 @@ if st.session_state.stage == "input":
         st.divider()
         st.text_input("Selskapsnavn *", key="company_name")
         st.text_input(
-            "Gründer / daglig leder *",
-            key="founder",
-            placeholder="Fornavn Etternavn, Tittel – flere: Navn 1, CEO / Navn 2, CTO",
+            "Selskapets hovedkontakt – fullt navn og rolle *",
+            key="main_contact",
+            placeholder="F.eks. Richard Nystad, daglig leder",
+            help="Personen Aggrator har som hovedkontakt i selskapet – som regel daglig leder eller gründer. Brukes til sitat og omtale i artikkelen.",
+        )
+        st.text_input(
+            "Andre grunnleggere / sentrale teammedlemmer (valgfritt)",
+            key="other_team",
+            placeholder="F.eks. Kari Hansen, teknisk sjef / Per Olsen, medgründer – la stå tom hvis ingen andre",
+            help="Kun hvis det er flere du vil ha med. La feltet stå tomt hvis det ikke er noen andre.",
         )
         st.text_area("Hva driver selskapet med? *", key="description", height=100)
         st.text_area("Ekstra notater", key="notes", height=90,
             placeholder="Investeringsbeløp, partnere, milepæler, sitater, lenker ...")
         ready = bool(
             st.session_state.company_name.strip()
-            and st.session_state.founder.strip()
+            and st.session_state.main_contact.strip()
             and st.session_state.description.strip()
         )
 
@@ -160,9 +193,9 @@ if st.session_state.stage == "input":
     elif news == "type_c":
         st.divider()
         st.text_input("Program / arrangement *", key="topic",
-            placeholder="F.eks. AgriScale Spain 2026 ...")
-        st.text_area("Hva skjedde? *", key="key_points", height=130,
-            placeholder="Beskriv per dag eller fase – hvem møtte dere, hva ble resultatet ...")
+            placeholder="F.eks. AgriScale Spain 2026, Esse kull 3 ...")
+        st.text_area("Beskriv arrangementet *", key="key_points", height=150,
+            placeholder="Fortell fritt – bakgrunn, høydepunkter, møter, resultater, stemning, deltakere, sitater ... Skriv det du husker, agenten finner strukturen.")
         st.text_area("Ekstra notater", key="notes", height=90)
         ready = bool(st.session_state.topic.strip() and st.session_state.key_points.strip())
 
@@ -185,29 +218,57 @@ if st.session_state.stage == "input":
         st.divider()
         file_label = (
             "Filer fra selskapet (pitch deck, pressemelding ...)"
-            if news == "selskapsnyhet"
+            if news == "type_b"
             else "Kontekstfiler (rapport, pressemelding, bakgrunnsnotat ...)"
         )
-        uploaded = st.file_uploader(
-            file_label,
-            type=["pdf", "pptx", "docx", "txt"],
-            accept_multiple_files=True,
+        with st.expander("Legg ved kildefiler (valgfritt)"):
+            uploaded = st.file_uploader(
+                file_label,
+                type=["pdf", "pptx", "docx", "txt"],
+                accept_multiple_files=True,
+                label_visibility="collapsed",
+            )
+
+        st.markdown("**Bilde til artikkelen \\***")
+        image_file = st.file_uploader(
+            "Bilde til artikkelen",
+            type=["jpg", "jpeg", "png", "webp"],
+            accept_multiple_files=False,
+            label_visibility="collapsed",
+            key="image_uploader",
         )
+        if image_file is not None:
+            st.image(image_file, width=320)
+        elif st.session_state.article_image:
+            st.caption(f"Tidligere opplastet: {st.session_state.article_image['name']}")
+
         responsible_label = (
-            "Ansvarlig for selskapet hos Aggrator *"
-            if news == "selskapsnyhet"
+            "Ansvarlig for selskapet hos Aggrator (KAM) *"
+            if news == "type_b"
             else "Ditt navn *"
         )
         st.text_input(responsible_label, key="responsible")
 
+        has_image = image_file is not None or bool(st.session_state.article_image)
+
         st.divider()
-        if st.button("Generer artikkel →", type="primary", disabled=not (ready and st.session_state.responsible.strip())):
+        if not has_image:
+            st.caption("Du må laste opp et bilde for å generere artikkelen.")
+        if st.button("Generer artikkel →", type="primary",
+                     disabled=not (ready and st.session_state.responsible.strip() and has_image)):
             st.session_state.uploaded_files = [
                 {"name": f.name, "bytes": f.read()} for f in (uploaded or [])
             ]
+            if image_file is not None:
+                st.session_state.article_image = {
+                    "name": image_file.name,
+                    "bytes": image_file.getvalue(),
+                    "mime": image_file.type or "image/jpeg",
+                }
             fields = {
                 "company_name":  st.session_state.company_name,
-                "founder":       st.session_state.founder,
+                "main_contact":  st.session_state.main_contact,
+                "other_team":    st.session_state.other_team,
                 "description":   st.session_state.description,
                 "aggrator_what": st.session_state.aggrator_what,
                 "aggrator_who":  st.session_state.aggrator_who,
@@ -216,15 +277,75 @@ if st.session_state.stage == "input":
                 "notes":         st.session_state.notes,
                 "responsible":   st.session_state.responsible,
             }
-            with st.spinner("Skriver artikkel..."):
-                draft = agent.generate_article(
+            # news_type lagres slik at type-velgeren gjenopprettes ved "← Tilbake"
+            # (Streamlit sletter widget-state for ikke-renderte widgets)
+            st.session_state.fields_snapshot = {**fields, "news_type": news}
+
+            with st.spinner("Analyserer informasjon..."):
+                context = agent._build_context(news, fields)
+                q_result = agent.generate_questions(
+                    context=context,
+                    is_incubator=(news == "type_b"),
+                    company_name=st.session_state.company_name,
                     news_type=news,
-                    fields=fields,
-                    corrections=load_corrections(),
                     files_data=st.session_state.uploaded_files,
                 )
-            st.session_state.draft = draft
-            st.session_state.vilde_edit = draft
+
+            questions = q_result.get("questions", [])
+            if questions:
+                st.session_state.questions = questions
+                st.session_state.stage = "questions"
+                st.rerun()
+            else:
+                # Selve skrivingen skjer streamende i draft-stadiet
+                st.session_state.pending_generation = {"news_type": news, "fields": fields}
+                st.session_state.pop("draft_textarea", None)
+                st.session_state.stage = "draft"
+                st.rerun()
+
+
+# ─── STAGE: questions ─────────────────────────────────────────────────────────
+
+elif st.session_state.stage == "questions":
+    st.title("Utfyllende spørsmål")
+    st.caption("Agenten trenger litt mer informasjon for å skrive et godt utkast. Du kan hoppe over spørsmål du ikke har svar på nå.")
+
+    for i, q in enumerate(st.session_state.questions):
+        # Gjenopprett tidligere svar når man kommer tilbake fra utkast
+        # (Streamlit sletter widget-state for ikke-renderte widgets)
+        if f"q_answer_{i}" not in st.session_state and i in st.session_state.answers_snapshot:
+            st.session_state[f"q_answer_{i}"] = st.session_state.answers_snapshot[i]
+        st.text_area(q, key=f"q_answer_{i}", height=80)
+
+    st.divider()
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("← Tilbake"):
+            for k, v in st.session_state.fields_snapshot.items():
+                st.session_state[k] = v
+            st.session_state.stage = "input"
+            st.rerun()
+    with col2:
+        if st.button("Generer utkast →", type="primary"):
+            answers = []
+            answers_snap = {}
+            for i, q in enumerate(st.session_state.questions):
+                ans = st.session_state.get(f"q_answer_{i}", "").strip()
+                answers_snap[i] = ans
+                if ans:
+                    answers.append(f"- {q}: {ans}")
+            st.session_state.answers_snapshot = answers_snap
+
+            fields = dict(st.session_state.fields_snapshot)
+            if answers:
+                fields["extra_context"] = "\n".join(answers)
+
+            # Selve skrivingen skjer streamende i draft-stadiet
+            st.session_state.pending_generation = {
+                "news_type": st.session_state.news_type,
+                "fields": fields,
+            }
+            st.session_state.pop("draft_textarea", None)
             st.session_state.stage = "draft"
             st.rerun()
 
@@ -234,20 +355,77 @@ if st.session_state.stage == "input":
 elif st.session_state.stage == "draft":
     st.title("Artikkelutkast")
 
-    tab1, tab2 = st.tabs(["Forhåndsvisning", "Markdown"])
+    # Streamende generering: skriv artikkelen synlig bit for bit, lagre, og
+    # rerun til den redigerbare visningen.
+    if st.session_state.pending_generation:
+        pg = st.session_state.pending_generation
+        st.caption("Skriver artikkelen …")
+        show_article_image()
+        try:
+            stream = agent.generate_article_stream(
+                news_type=pg["news_type"],
+                fields=pg["fields"],
+                corrections=load_corrections(),
+                files_data=st.session_state.uploaded_files,
+                image_data=st.session_state.article_image,
+            )
+            draft = st.write_stream(stream).strip()
+        except Exception:
+            # Faller tilbake til vanlig (ikke-streamende) generering ved feil
+            draft = agent.generate_article(
+                news_type=pg["news_type"],
+                fields=pg["fields"],
+                corrections=load_corrections(),
+                files_data=st.session_state.uploaded_files,
+                image_data=st.session_state.article_image,
+            )
+        st.session_state.draft = draft
+        st.session_state.vilde_edit = draft
+        st.session_state.pop("draft_textarea", None)
+        st.session_state.pending_generation = None
+        st.rerun()
+
+    st.caption("Rediger fritt og fyll inn eventuelle [MANGLER]-felt før du sender til korrektur.")
+
+    if "draft_textarea" not in st.session_state:
+        st.session_state["draft_textarea"] = st.session_state.draft
+
+    tab1, tab2 = st.tabs(["Rediger", "Forhåndsvisning"])
     with tab1:
-        st.markdown(st.session_state.draft)
+        st.text_area("Artikkel", key="draft_textarea", height=520, label_visibility="collapsed")
     with tab2:
-        st.code(st.session_state.draft, language="markdown")
+        st.markdown(st.session_state.get("draft_textarea", st.session_state.draft))
+        show_article_image()
+
+    current = st.session_state.get("draft_textarea", st.session_state.draft)
+    if "[MANGLER" in current:
+        st.warning("Utkastet inneholder fortsatt [MANGLER]-felt. Du kan fylle dem inn nå, eller la Vilde gjøre det i korrektur.")
 
     st.divider()
     col1, col2 = st.columns(2)
     with col1:
         if st.button("← Tilbake"):
-            st.session_state.stage = "input"
+            # Ett steg tilbake: til spørsmålene hvis de finnes, ellers til inndata
+            st.session_state.pop("draft_textarea", None)
+            if st.session_state.questions:
+                st.session_state.stage = "questions"
+            else:
+                for k, v in st.session_state.fields_snapshot.items():
+                    st.session_state[k] = v
+                st.session_state.stage = "input"
             st.rerun()
     with col2:
         if st.button("Send til korrektur hos Vilde →", type="primary"):
+            edited = st.session_state.get("draft_textarea", st.session_state.draft)
+            st.session_state.draft = edited
+            st.session_state.vilde_edit = edited
+            sent, msg = agent.send_article_to_vilde(
+                article=edited,
+                responsible=st.session_state.responsible,
+                news_type=st.session_state.news_type,
+                image_data=st.session_state.article_image,
+            )
+            st.session_state.email_sent = (sent, msg)
             if "vilde_textarea" in st.session_state:
                 del st.session_state["vilde_textarea"]
             st.session_state.stage = "vilde_review"
@@ -260,6 +438,23 @@ elif st.session_state.stage == "vilde_review":
     st.title("Korrektur – kommunikasjonssjef")
     st.caption("Les artikkelen og gjør endringer direkte i tekstfeltet.")
 
+    if st.session_state.email_sent is not None:
+        sent, msg = st.session_state.email_sent
+        if sent:
+            st.success(msg)
+        elif "ikke konfigurert" in msg:
+            st.warning(
+                f"{msg}. "
+                "For å aktivere e-postvarsler, fyll ut SMTP_HOST, SMTP_USER og "
+                "SMTP_PASSWORD i `nyhetssaker/interface/.env` og start appen på nytt."
+            )
+        else:
+            st.warning(
+                f"{msg}. Artikkelen er ikke påvirket – du kan fortsette korrekturen, "
+                "og eventuelt prøve å sende på nytt fra utkast-steget."
+            )
+        st.session_state.email_sent = None
+
     if "vilde_textarea" not in st.session_state:
         st.session_state["vilde_textarea"] = st.session_state.vilde_edit
 
@@ -268,6 +463,7 @@ elif st.session_state.stage == "vilde_review":
         st.text_area("Artikkel", key="vilde_textarea", height=520, label_visibility="collapsed")
     with tab2:
         st.markdown(st.session_state.get("vilde_textarea", st.session_state.vilde_edit))
+        show_article_image()
 
     st.divider()
     col1, col2 = st.columns(2)
@@ -310,6 +506,7 @@ elif st.session_state.stage == "company_review":
         st.text_area("Artikkel", key="company_textarea", height=520, label_visibility="collapsed")
     with tab2:
         st.markdown(st.session_state.get("company_textarea", st.session_state.company_edit))
+        show_article_image()
 
     st.divider()
     col1, col2 = st.columns(2)
@@ -357,19 +554,29 @@ elif st.session_state.stage == "done":
     tab1, tab2 = st.tabs(["Forhåndsvisning", "Markdown"])
     with tab1:
         st.markdown(final)
+        show_article_image()
     with tab2:
         st.code(final, language="markdown")
 
     st.divider()
-    col1, col2 = st.columns(2)
-    with col1:
+    img = st.session_state.get("article_image")
+    cols = st.columns(3 if img else 2)
+    with cols[0]:
         st.download_button(
             "Last ned .md",
             data=final,
             file_name=f"artikkel-{datetime.now().strftime('%Y%m%d-%H%M')}.md",
             mime="text/markdown",
         )
-    with col2:
+    if img:
+        with cols[1]:
+            st.download_button(
+                "Last ned bilde",
+                data=img["bytes"],
+                file_name=img.get("name", "bilde.jpg"),
+                mime=img.get("mime", "image/jpeg"),
+            )
+    with cols[-1]:
         if st.button("Skriv ny artikkel", type="primary"):
             reset_session()
             st.rerun()
